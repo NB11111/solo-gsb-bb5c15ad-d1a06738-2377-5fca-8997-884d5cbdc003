@@ -55,6 +55,7 @@ def build_forecast(
     end_date,
     sessions: list[tuple],
     stock: dict[str, float],
+    suspended_dates: list | None = None,
 ) -> dict:
     """Compute the consumption forecast.
 
@@ -62,6 +63,10 @@ def build_forecast(
     version; ``stock`` maps every concentrate name used by the result to
     its current on-hand mL.  Raises :class:`ForecastError` when the stock
     keys do not match the result's concentrate names exactly.
+    ``suspended_dates`` are local no-irrigation days: no batches start on
+    them and no concentrate is consumed on their account (a batch from
+    the previous local day crossing midnight in is still attributed to
+    that previous day).
     """
     allocations = solve_result.get("allocations") or []
     names = [str(a.get("concentrate")) for a in allocations]
@@ -96,6 +101,7 @@ def build_forecast(
         end_date=end_date,
         sessions=sessions,
         daily_capacity_ml=None,
+        suspended_dates=suspended_dates,
     )
 
     total_days = (end_date - start_date).days + 1
@@ -103,6 +109,10 @@ def build_forecast(
         (start_date + timedelta(days=i)).isoformat()
         for i in range(total_days)
     ]
+    suspended_set = {
+        d.isoformat() if hasattr(d, "isoformat") else str(d)
+        for d in (suspended_dates or [])
+    }
     # Cumulative per-liquid totals up to and including each day.
     day_required: dict[str, dict[str, float]] = {
         d: {n: 0.0 for n in names} for d in all_dates
@@ -215,6 +225,7 @@ def build_forecast(
         days_out.append(
             {
                 "date": d,
+                "suspended": d in suspended_set,
                 "batches": day_batches[d],
                 "water_ml": _r(day_water[d]),
                 "sufficient": day_sufficient[d],
@@ -262,6 +273,7 @@ def build_forecast(
         "start_date": plan["start_date"],
         "end_date": plan["end_date"],
         "days": plan["days"],
+        "suspended_dates": plan["suspended_dates"],
         "batch_count_before_merge": plan["batch_count_before_merge"],
         "batch_count_after_merge": plan["batch_count_after_merge"],
         "planned_water_ml": _r(plan["planned_water_ml"]),

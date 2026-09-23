@@ -20,6 +20,12 @@ absolute (UTC) execution batches:
   total (water is attributed to the local calendar day the session was
   scheduled for). Over-capacity days get an explicit ``shortfall_ml``;
   batches are still returned in full.
+* A set of local **suspended dates** (no-irrigation days) suppresses
+  every session scheduled *on* those local calendar days. A batch that
+  started on the previous local day and merely runs across midnight into
+  a suspended day is not cancelled: suspension applies to the sessions
+  starting on the suspended day only. Suspended days are echoed back and
+  flagged in the per-day results (zero batches, zero planned water).
 """
 from __future__ import annotations
 
@@ -130,6 +136,7 @@ def build_plan(
     sessions: list[tuple[time, str, float, float]],
     daily_capacity_ml: float | None,
     merge_gap_seconds: int = 60,
+    suspended_dates: list[date] | None = None,
 ) -> dict:
     """Build the full irrigation plan structure.
 
@@ -137,10 +144,13 @@ def build_plan(
     duration_minutes, water_ml)`` tuples already validated by the
     Pydantic layer.  ``daily_capacity_ml=None`` skips the capacity
     checks entirely (used by the consumption forecast, which has no
-    device-capacity input).
+    device-capacity input).  ``suspended_dates`` are local calendar
+    days on which no sessions are scheduled (sessions crossing into
+    them from the previous local day still run).
     """
     tz_key = getattr(tz, "key", None) or str(tz)
     total_days = (end_date - start_date).days + 1
+    suspended = set(suspended_dates or [])
 
     # ---- 1. one raw batch per (day, session) ---------------------------- #
     raw: list[_RawBatch] = []
@@ -154,6 +164,12 @@ def build_plan(
         day_water[day] = 0.0
         day_gap[day] = False
         day_dup[day] = False
+        # Suspended local day: do not schedule any session starting today.
+        # A batch started on the previous local day that crosses midnight
+        # into this day still exists (it was generated for that previous
+        # day) and is neither removed nor attributed here.
+        if day in suspended:
+            continue
         for local_time, requested_text, duration_minutes, water_ml in ordered:
             start_aware, event, note = _resolve_local(day, local_time, tz)
             start_utc = start_aware.astimezone(timezone.utc)
@@ -215,9 +231,10 @@ def build_plan(
     total_planned = 0.0
     for i in range(total_days):
         day = start_date + timedelta(days=i)
+        is_suspended = day in suspended
         planned = day_water[day]
         total_planned += planned
-        if daily_capacity_ml is None:
+        if daily_capacity_ml is None or is_suspended:
             over = False
         else:
             over = planned > daily_capacity_ml + 1e-9
@@ -230,6 +247,7 @@ def build_plan(
         days_out.append(
             {
                 "date": day.isoformat(),
+                "suspended": is_suspended,
                 "batch_count_before_merge": day_batch_counts[day],
                 "batch_count_after_merge": day_merged_batch_counts[day],
                 "planned_water_ml": planned,
@@ -283,6 +301,11 @@ def build_plan(
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "days": total_days,
+        "suspended_dates": [
+            (start_date + timedelta(days=i)).isoformat()
+            for i in range(total_days)
+            if (start_date + timedelta(days=i)) in suspended
+        ],
         "batch_count_before_merge": raw_count,
         "batch_count_after_merge": len(merged),
         "merge_gap_seconds": merge_gap_seconds,

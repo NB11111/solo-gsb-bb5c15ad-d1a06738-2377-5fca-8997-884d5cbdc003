@@ -427,6 +427,68 @@ with TestClient(app) as client:
     assert r.status_code == 422
     print("21) all invalid irrigation inputs rejected with 422")
 
+    # 21b) local suspended dates: no batches that day, but a batch from
+    #      the previous local day crossing midnight is not cancelled ----- #
+    susp = irr_body(suspended_dates=["2026-05-02"])
+    d = client.post("/api/irrigation/plan", json=susp).json()
+    assert d["suspended_dates"] == ["2026-05-02"]
+    # day 2 generates nothing: 2 active days x 3 sessions = 6 raw
+    assert d["batch_count_before_merge"] == 6
+    assert d["planned_water_ml"] == 2000  # only 05-01 and 05-03
+    sdays = {x["date"]: x for x in d["day_results"]}
+    assert sdays["2026-05-02"]["suspended"] is True
+    assert sdays["2026-05-02"]["batch_count_before_merge"] == 0
+    assert sdays["2026-05-02"]["batch_count_after_merge"] == 0
+    assert sdays["2026-05-02"]["planned_water_ml"] == 0
+    assert sdays["2026-05-02"]["within_capacity"] is True
+    assert sdays["2026-05-01"]["suspended"] is False
+    # no source starts on the suspended day ...
+    assert all(
+        src["day"] != "2026-05-02"
+        for b in d["batches"] for src in b["sources"]
+    )
+    # ... yet 05-01 23:55 still crosses INTO the suspended 05-02 00:05
+    into = [
+        b for b in d["batches"]
+        if b["local_start"][:10] == "2026-05-01"
+        and b["local_end"][:10] == "2026-05-02"
+    ]
+    assert len(into) == 1 and into[0]["water_ml"] == 300
+    # omitted field is accepted as "no suspension"
+    assert client.post(
+        "/api/irrigation/plan", json=irr_body()
+    ).json()["suspended_dates"] == []
+
+    # 21c) suspended dates interpreted in the request timezone: local
+    #      2024-01-02 00:30 in Auckland is still 2024-01-01 in UTC ----- #
+    tz_susp = {
+        "timezone": "Pacific/Auckland",
+        "start_date": "2024-01-01", "end_date": "2024-01-02",
+        "sessions": [
+            {"start_time": "00:30", "duration_minutes": 10, "water_ml": 100},
+            {"start_time": "23:40", "duration_minutes": 40, "water_ml": 200},
+        ],
+        "daily_capacity_ml": 1000,
+        "suspended_dates": ["2024-01-02"],
+    }
+    d = client.post("/api/irrigation/plan", json=tz_susp).json()
+    # only the two sessions starting on local 01-01 exist; the 23:40 one
+    # crosses into the suspended day 00:20 local and is not cancelled
+    assert d["batch_count_before_merge"] == 2
+    b1 = [b for b in d["batches"] if b["water_ml"] == 200][0]
+    assert b1["local_start"] == "2024-01-01T23:40:00+1300"
+    assert b1["local_end"] == "2024-01-02T00:20:00+1300"
+    print("21b/c) suspended dates: day skipped, previous-day "
+          "cross-midnight batch kept, timezone-interpreted")
+
+    # 21d) bad suspended_dates -> 422 ------------------------------------ #
+    irr_422({"suspended_dates": ["2026-04-30"]}, "suspended before range")
+    irr_422({"suspended_dates": ["2026-05-04"]}, "suspended after range")
+    irr_422({"suspended_dates": ["2026-05-02", "2026-05-02"]},
+            "duplicate suspended date")
+    irr_422({"suspended_dates": ["nope"]}, "bad suspended date")
+    print("21d) invalid suspended_dates rejected with 422")
+
     # =================================================================== #
     # Consumption forecast
     # (POST /api/recipes/{id}/versions/{v}/consumption-forecast)
@@ -528,6 +590,47 @@ with TestClient(app) as client:
     assert late["liquids"][1]["first_shortfall_date"] == "2026-05-03"
     assert late["liquids"][0]["first_shortfall_date"] is None
 
+    # 24b) suspended day: no batches/consumption on 05-02; the 05-01
+    #      23:55 batch crossing into it is still deducted on 05-01 ----- #
+    susp = fc_body(
+        suspended_dates=["2026-05-02"],
+        stock=[{"concentrate": "A液", "stock_ml": 100000},
+               {"concentrate": "B液", "stock_ml": 100000}],
+    )
+    d = client.post(fc_url, json=susp).json()
+    assert d["suspended_dates"] == ["2026-05-02"]
+    # 2 active days x 1000 mL = 2000 mL -> A 300, B 25
+    assert d["planned_water_ml"] == 2000
+    assert d["batch_count_before_merge"] == 6
+    assert d["batch_count_after_merge"] == 4
+    days = {x["date"]: x for x in d["day_results"]}
+    sd = days["2026-05-02"]
+    assert sd["suspended"] is True
+    assert sd["batches"] == 0 and sd["water_ml"] == 0
+    d1 = days["2026-05-01"]
+    for l0, l2 in zip(d1["liquids"], sd["liquids"]):
+        assert l2["required_ml"] == 0 and l2["consumed_ml"] == 0
+        assert l2["remaining_ml"] == l0["remaining_ml"]
+    # cross-midnight batch from 05-01 into suspended 05-02 counts once
+    xb = [b for b in d["batches"] if b["crosses_midnight"]]
+    assert len(xb) == 2
+    assert xb[0]["attributed_date"] == "2026-05-01"
+    assert xb[0]["local_end"][:10] == "2026-05-02"
+    assert d["sufficient"] is True and d["first_shortfall_date"] is None
+    liq = {x["concentrate"]: x for x in d["liquids"]}
+    assert abs(liq["A液"]["total_required_ml"] - 300) < 1e-6
+    assert abs(liq["B液"]["total_required_ml"] - 25) < 1e-6
+
+    # suspending the shortage day shifts first_shortfall_date past it
+    d = client.post(fc_url, json=fc_body(
+        suspended_dates=["2026-05-02"],
+        stock=[{"concentrate": "A液", "stock_ml": 100000},
+               {"concentrate": "B液", "stock_ml": 22.5}])).json()
+    # day1 needs 12.5 B; day3 needs 12.5 more but only 10 remain
+    assert d["first_shortfall_date"] == "2026-05-03", d["first_shortfall_date"]
+    print("24b) forecast suspension: zero draw-down on suspended day, "
+          "cross-midnight batch still counted")
+
     # 25) forecast 4xx: missing/unknown/negative/duplicate stock, bad plan #
     assert client.post(
         f"/api/recipes/999/versions/1/consumption-forecast",
@@ -556,6 +659,9 @@ with TestClient(app) as client:
     fc_422({"timezone": "Mars/Olympus"}, "bad tz")
     fc_422({"end_date": "2026-04-30"}, "bad range")
     fc_422({"sessions": []}, "empty sessions")
+    fc_422({"suspended_dates": ["2026-05-04"]}, "suspended after range")
+    fc_422({"suspended_dates": ["2026-05-02", "2026-05-02"]},
+           "duplicate suspended date")
     bad_fc = fc_body()
     bad_fc["bogus"] = 1
     assert client.post(fc_url, json=bad_fc).status_code == 422
