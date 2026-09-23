@@ -50,8 +50,8 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions` | 某配方的全部版本 |
 | GET | `/api/recipes/{id}/versions/{v}` | 读取某版本完整内容（请求 + 结果） |
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
-| POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期 |
-| POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验） |
+| POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
+| POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
 | GET | `/health` | 健康检查 |
 
 ### 单位约定
@@ -190,6 +190,7 @@ curl -s -OJ http://localhost:8000/api/recipes/1/versions/1/export
 
 - **跨午夜**：批次用真实流逝时间的 UTC 区间表示，结束时间落在次日也能正确显示；
 - **夏令时**：春季跳变时**不存在的本地时间**自动顺延（如纽约 `02:30` 缺失 → `03:30 EDT`，批次上标注 `dst_event: "gap"`）；秋季回拨时**重复的本地时间**取第一次出现（`"duplicate"`，并说明第二次出现的 UTC 偏移）；
+- **停灌日**：请求可带 `suspended_dates` 本地日期列表（按 `timezone` 解释），列表中的日期**不生成当天排定的灌溉批次**，响应仍在 `day_results` 与顶层 `suspended_dates` 中保留这些日期并标明 `"suspended": true`；停灌只影响该日排定时段，**不取消前一日本地日期开始、跨入该日的跨午夜批次**；
 - **合并与容量**：按 UTC 开始时间排序，相邻且**间隔 ≤ 1 分钟（含重叠）**的批次合并（合并可以跨越午夜）；每日容量按**合并前**当日计划总水量校验，超出的日期返回**明确缺口**（`shortfall_ml`），批次照常返回、**绝不截断水量**。
 
 ### 请求
@@ -206,7 +207,8 @@ curl -s http://localhost:8000/api/irrigation/plan \
       {"start_time": "08:10:30",  "duration_minutes": 5,  "water_ml": 200},
       {"start_time": "23:55",     "duration_minutes": 10, "water_ml": 300}
     ],
-    "daily_capacity_ml": 1100
+    "daily_capacity_ml": 1100,
+    "suspended_dates": ["2026-05-02"]
   }'
 ```
 
@@ -220,10 +222,11 @@ curl -s http://localhost:8000/api/irrigation/plan \
 | `sessions[].duration_minutes` | 持续分钟数，必须为正；批次按真实流逝时间结束，可自然跨过午夜与 DST 跳变 |
 | `sessions[].water_ml` | 本次目标水量 (mL)，必须为正 |
 | `daily_capacity_ml` | 设备每日供水容量 (mL)，非负（`0` 表示当日不可供水，必然产生缺口） |
+| `suspended_dates` | 可选，**本地停灌日期**列表（`YYYY-MM-DD`，按 `timezone` 解释）。列表中的日期不排定当日批次、当日计划水量为 0；响应原样回显（升序）并在 `day_results[].suspended` 标 `true`。日期必须落在 `start_date`~`end_date` 内且不可重复，否则 422。前一日开始、跨入停灌日的跨午夜批次**照常执行**，停灌日不产生容量缺口 |
 
 ### 响应（节选）
 
-`08:00` 的批次在 `08:10` 结束，与 `08:10:30` 开始的批次只隔 30 秒（≤ 1 分钟），被合并成一个 700 mL、`08:00–08:15:30` 的批次；`23:55` 的批次跨到次日 `00:05`：
+`08:00` 的批次在 `08:10` 结束，与 `08:10:30` 开始的批次只隔 30 秒（≤ 1 分钟），被合并成一个 700 mL、`08:00–08:15:30` 的批次；`23:55` 的批次跨到次日 `00:05`。下例把 `2026-05-02` 列为停灌日：当天不排定任何批次（3 个原始时段全部不生成），但 **`05-01` 晚 `23:55` 开始、跨入 `05-02 00:05` 的批次照常执行**：
 
 ```json
 {
@@ -231,19 +234,32 @@ curl -s http://localhost:8000/api/irrigation/plan \
   "start_date": "2026-05-01",
   "end_date": "2026-05-03",
   "days": 3,
-  "batch_count_before_merge": 9,
-  "batch_count_after_merge": 6,
+  "suspended_dates": ["2026-05-02"],
+  "batch_count_before_merge": 6,
+  "batch_count_after_merge": 4,
   "merge_gap_seconds": 60,
-  "planned_water_ml": 3000.0,
+  "planned_water_ml": 2000.0,
   "daily_capacity_ml": 1100,
   "capacity_ok": true,
   "capacity_violations": [],
   "day_results": [
     {
       "date": "2026-05-01",
+      "suspended": false,
       "batch_count_before_merge": 3,
       "batch_count_after_merge": 2,
       "planned_water_ml": 1000.0,
+      "daily_capacity_ml": 1100,
+      "within_capacity": true,
+      "shortfall_ml": 0.0,
+      "dst_events": []
+    },
+    {
+      "date": "2026-05-02",
+      "suspended": true,
+      "batch_count_before_merge": 0,
+      "batch_count_after_merge": 0,
+      "planned_water_ml": 0.0,
       "daily_capacity_ml": 1100,
       "within_capacity": true,
       "shortfall_ml": 0.0,
@@ -279,11 +295,19 @@ curl -s http://localhost:8000/api/irrigation/plan \
       "merged": false,
       "batch_count_before_merge": 1,
       "crosses_midnight": true,
-      "sources": [/* ... */]
+      "sources": [/* 05-01 排定、跨入停灌日 05-02：不取消，只在 05-01 计一次 */]
     }
   ]
 }
 ```
+
+停灌语义要点：
+
+- **只抑制当日排定的时段**：`suspended_dates` 中的本地日期不生成任何以该日为计划日（`sources[].day`）的批次，`day_results` 中该日 `suspended=true`、批次计数与 `planned_water_ml` 均为 0；顶层 `suspended_dates` 原样回显（自动升序）。
+- **跨午夜批次不受影响**：前一日本地日期开始的批次按真实流逝时间执行，结束时间落在停灌日也照常返回（上例 `2026-05-01T15:55Z → 16:05Z`），水量计入开始日；反向亦然——若停灌的是开始日本身，则该日 23:55 的批次也不会生成。
+- **不计容量缺口**：停灌日计划水量为 0，恒为 `within_capacity=true`，即使 `daily_capacity_ml=0` 也不会出现在 `capacity_violations` 中。
+- 日期按请求 `timezone` 的本地日历解释；超出 `start_date~end_date`、重复或格式非法均返回 422；不带该字段（或空列表）时行为与原来完全一致。
+
 
 ### 夏令时与容量缺口
 
@@ -316,7 +340,7 @@ curl -s http://localhost:8000/api/irrigation/plan \
 }
 ```
 
-以下情况一律返回 **422**：非法时区（`Mars/Olympus`、`+08:00`、空串）、日期顺序颠倒或超过 370 天、时间格式非法（`25:00`）、`sessions` 为空或开始时间重复、持续分钟数/水量非正、容量为负、多余字段。
+以下情况一律返回 **422**：非法时区（`Mars/Olympus`、`+08:00`、空串）、日期顺序颠倒或超过 370 天、时间格式非法（`25:00`）、`sessions` 为空或开始时间重复、持续分钟数/水量非正、容量为负、`suspended_dates` 日期重复/超出范围/格式非法、多余字段。
 
 ## 库存消耗预测（POST /api/recipes/{id}/versions/{v}/consumption-forecast）
 
@@ -327,6 +351,7 @@ curl -s http://localhost:8000/api/irrigation/plan \
 对**每个实际灌溉批次（合并后）**的水量等比例扣减库存，并按本地日汇总：
 
 - **跨午夜 / 合并批次只扣一次**：批次按 UTC 开始时间排序，相邻 ≤ 1 分钟（含重叠）的批次已合并；每个合并后批次整体计入其**本地开始日期**，绝不会因为跨到次日而重复扣减；
+- **停灌日不扣减**：请求可带 `suspended_dates` 本地日期列表（按 `timezone` 解释），列表中的日期不排定批次、不消耗库存；响应顶层回显 `suspended_dates`，`day_results[]` 中对应日期标 `"suspended": true`、水量/需求均为 0。停灌只影响当日排定时段，**前一日本地日期开始、跨入停灌日的批次仍照常扣减一次**（归属前一日）；
 - **不足时保留完整预测**：任一浓缩液不够本批使用时，批次水量与各液需求量保持完整，实际扣减到 0 为止、缺口标记在该批次（`shortfall_ml`）和当日汇总上，**绝不出现负库存**，后续批次仍按原计划照常预测；
 - 输出每液全程汇总（`mix_ml_per_l`、总需求/总扣减/总缺口、剩余、`first_shortfall_date`）、逐日消耗与日末剩余，以及顶层 `first_shortfall_date`（首个出现任一液不足的本地日期；全程充足为 `null`）。
 
@@ -352,7 +377,32 @@ curl -s -X POST \
   }'
 ```
 
-计划参数（`timezone` / `start_date` / `end_date` / `sessions`）的含义与校验规则与 [灌溉计划](#灌溉计划post-apirrigationplan) 完全一致（同日重复开始时间、非法时区/日期、空时段、非正时长/水量等均返回 422）；本接口不接收 `daily_capacity_ml`。`stock` 为各浓缩液当前库存（mL），名称必须与该版本求解结果中的 `allocations[].concentrate` **一一对应**：多给未知液体、缺少某液、名称重复、库存为负均返回 422。
+计划参数（`timezone` / `start_date` / `end_date` / `sessions` / `suspended_dates`）的含义与校验规则与 [灌溉计划](#灌溉计划post-apirrigationplan) 完全一致（同日重复开始时间、非法时区/日期、空时段、非正时长/水量、停灌日期重复或超出范围等均返回 422）；本接口不接收 `daily_capacity_ml`。`stock` 为各浓缩液当前库存（mL），名称必须与该版本求解结果中的 `allocations[].concentrate` **一一对应**：多给未知液体、缺少某液、名称重复、库存为负均返回 422。
+
+`suspended_dates` 为可选的本地停灌日期列表。例如，把中间一天停灌，则该日不排定批次、不扣减库存，顶层与逐日结果都会标明停灌；前一日晚开始的跨午夜批次照常扣减：
+
+```bash
+curl -s -X POST \
+  http://localhost:8000/api/recipes/1/versions/1/consumption-forecast \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "Asia/Shanghai",
+    "start_date": "2026-05-01",
+    "end_date": "2026-05-03",
+    "sessions": [
+      {"start_time": "08:00",     "duration_minutes": 10, "water_ml": 500},
+      {"start_time": "08:10:30",  "duration_minutes": 5,  "water_ml": 200},
+      {"start_time": "23:55",     "duration_minutes": 10, "water_ml": 300}
+    ],
+    "suspended_dates": ["2026-05-02"],
+    "stock": [
+      {"concentrate": "A液", "stock_ml": 100000},
+      {"concentrate": "B液", "stock_ml": 100000}
+    ]
+  }'
+```
+
+该请求只在 `05-01`、`05-03` 灌溉（合计 2000 mL，共 6 个原始批次→4 个合并批次）：响应顶层回显 `"suspended_dates": ["2026-05-02"]`，`day_results` 中 `2026-05-02` 为 `{"date": "2026-05-02", "suspended": true, "batches": 0, "water_ml": 0.0, ...}`，各液当日需求/扣减均为 0、日末剩余与前一日相同；`05-01 23:55` 跨入 `05-02 00:05` 的批次仍在 `batches[]` 中，`attributed_date` 为 `2026-05-01`、只扣一次。
 
 ### 响应（节选与说明）
 
@@ -368,6 +418,7 @@ curl -s -X POST \
   "start_date": "2026-05-01",
   "end_date": "2026-05-03",
   "days": 3,
+  "suspended_dates": [],
   "batch_count_before_merge": 9,
   "batch_count_after_merge": 6,
   "planned_water_ml": 3000.0,
@@ -398,6 +449,7 @@ curl -s -X POST \
   "day_results": [
     {
       "date": "2026-05-01",
+      "suspended": false,
       "batches": 2,
       "water_ml": 1000.0,
       "sufficient": false,
@@ -448,6 +500,7 @@ curl -s -X POST \
 要点：
 
 - `batches[]` 按执行顺序给出每个实际批次；合并批次的需求按**合并后总水量**折算（上例 700 mL → A 105 mL），两个源时段不会各扣一次；跨午夜批次 `attributed_date` 取本地开始日。
+- 停灌日不出现在 `batches[]` 的 `attributed_date` 中；`day_results[]` 中对应行 `suspended=true`、`batches=0`，但前一日开始跨入停灌日的批次仍归属前一日并正常扣减。
 - 库存耗尽后的批次仍保留完整 `required_ml`，`consumed_ml=0`、`shortfall_ml=required_ml`，所有 `remaining_ml` 恒 ≥ 0。
 - `day_results[]` 覆盖日期范围内每一天（即使某天因计划形态没有归属批次也会出现，水量为 0），`remaining_ml` 为该日结束时的累计剩余。
 - 库存恰好能撑到计划结束（最后一批扣完正好为 0）视为充足，`sufficient=true`。
@@ -456,7 +509,7 @@ curl -s -X POST \
 错误码：
 
 - **404**：配方不存在、或该配方下版本不存在（如 `/api/recipes/1/versions/99/...`）；
-- **422**：库存名称未知（`未知浓缩液：C液`）、缺少某液（`库存缺少…浓缩液`）、库存为负或名称重复；以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、多余字段）。
+- **422**：库存名称未知（`未知浓缩液：C液`）、缺少某液（`库存缺少…浓缩液`）、库存为负或名称重复；以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、`suspended_dates` 重复或超出日期范围、多余字段）。
 
 ## 项目结构
 

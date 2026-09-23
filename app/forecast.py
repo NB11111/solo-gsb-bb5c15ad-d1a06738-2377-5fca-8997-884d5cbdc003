@@ -15,6 +15,10 @@ Forecast rules (all implemented here):
   in execution order (UTC start).  Cross-midnight and merged batches are
   therefore counted exactly once; the whole batch is attributed to its
   **local start date** for per-day reporting.
+* **Suspended local days** schedule no batches and consume no stock;
+  they are still echoed (flagged ``suspended``) in the per-day rows and
+  top-level ``suspended_dates``.  A cross-midnight batch begun on the
+  previous local day is not cancelled and is still deducted once.
 * When a bottle cannot cover its requirement, the batch still keeps its
   full planned water and full per-liquid requirement: consumption is
   clamped to the stock on hand and the missing amount is reported as
@@ -55,13 +59,16 @@ def build_forecast(
     end_date,
     sessions: list[tuple],
     stock: dict[str, float],
+    suspended_dates: set | None = None,
 ) -> dict:
     """Compute the consumption forecast.
 
     ``solve_result`` is the persisted ``result`` payload of the recipe
     version; ``stock`` maps every concentrate name used by the result to
-    its current on-hand mL.  Raises :class:`ForecastError` when the stock
-    keys do not match the result's concentrate names exactly.
+    its current on-hand mL.  Dates in ``suspended_dates`` schedule no
+    batches and consume no stock (a batch begun on the previous local
+    day still runs).  Raises :class:`ForecastError` when the stock keys
+    do not match the result's concentrate names exactly.
     """
     allocations = solve_result.get("allocations") or []
     names = [str(a.get("concentrate")) for a in allocations]
@@ -96,6 +103,7 @@ def build_forecast(
         end_date=end_date,
         sessions=sessions,
         daily_capacity_ml=None,
+        suspended_dates=suspended_dates,
     )
 
     total_days = (end_date - start_date).days + 1
@@ -103,6 +111,7 @@ def build_forecast(
         (start_date + timedelta(days=i)).isoformat()
         for i in range(total_days)
     ]
+    suspended = set(plan["suspended_dates"])
     # Cumulative per-liquid totals up to and including each day.
     day_required: dict[str, dict[str, float]] = {
         d: {n: 0.0 for n in names} for d in all_dates
@@ -215,6 +224,7 @@ def build_forecast(
         days_out.append(
             {
                 "date": d,
+                "suspended": d in suspended,
                 "batches": day_batches[d],
                 "water_ml": _r(day_water[d]),
                 "sufficient": day_sufficient[d],
@@ -262,6 +272,7 @@ def build_forecast(
         "start_date": plan["start_date"],
         "end_date": plan["end_date"],
         "days": plan["days"],
+        "suspended_dates": plan["suspended_dates"],
         "batch_count_before_merge": plan["batch_count_before_merge"],
         "batch_count_after_merge": plan["batch_count_after_merge"],
         "planned_water_ml": _r(plan["planned_water_ml"]),

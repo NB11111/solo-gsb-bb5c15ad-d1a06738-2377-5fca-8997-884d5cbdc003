@@ -427,6 +427,45 @@ with TestClient(app) as client:
     assert r.status_code == 422
     print("21) all invalid irrigation inputs rejected with 422")
 
+    # 21b) local suspended days ------------------------------------------ #
+    sd = client.post(
+        "/api/irrigation/plan",
+        json=irr_body(suspended_dates=["2026-05-02"]),
+    ).json()
+    # day 2 schedules nothing: 9 - 3 raw, 6 - 2 merged batches, 2000 mL
+    assert sd["suspended_dates"] == ["2026-05-02"]
+    assert sd["batch_count_before_merge"] == 6
+    assert sd["batch_count_after_merge"] == 4
+    assert sd["planned_water_ml"] == 2000
+    days_sd = {x["date"]: x for x in sd["day_results"]}
+    sday = days_sd["2026-05-02"]
+    assert sday["suspended"] is True
+    assert sday["batch_count_before_merge"] == 0
+    assert sday["planned_water_ml"] == 0 and sday["within_capacity"]
+    assert days_sd["2026-05-01"]["suspended"] is False
+    assert days_sd["2026-05-03"]["suspended"] is False
+    # cross-midnight batch started on day 1 (23:55 -> 05-02 00:05) survives
+    survive = [b for b in sd["batches"]
+               if b["start_utc"] == "2026-05-01T15:55:00Z"]
+    assert survive and survive[0]["crosses_midnight"]
+    # no batch starts on the suspended day
+    assert not any(b["local_start"].startswith("2026-05-02")
+                   for b in sd["batches"])
+    # unordered input is echoed sorted; capacity-0 never flags suspended day
+    sd2 = client.post("/api/irrigation/plan", json=irr_body(
+        daily_capacity_ml=0,
+        suspended_dates=["2026-05-03", "2026-05-01"])).json()
+    assert sd2["suspended_dates"] == ["2026-05-01", "2026-05-03"]
+    assert {v["date"] for v in sd2["capacity_violations"]} == {"2026-05-02"}
+    # day 2's 23:55 batch crosses INTO suspended 05-03 and is not cancelled
+    assert any(b["start_utc"] == "2026-05-02T15:55:00Z" and b["crosses_midnight"]
+               for b in sd2["batches"])
+    irr_422({"suspended_dates": ["2026-05-02", "2026-05-02"]},
+            "duplicate suspended date")
+    irr_422({"suspended_dates": ["2026-04-30"]}, "suspended before range")
+    irr_422({"suspended_dates": ["2026-05-04"]}, "suspended after range")
+    print("21b) suspended local days: no batches, cross-midnight kept ok")
+
     # =================================================================== #
     # Consumption forecast
     # (POST /api/recipes/{id}/versions/{v}/consumption-forecast)
@@ -581,5 +620,43 @@ with TestClient(app) as client:
     assert d["recipe_feasible"] is False
     assert d["warning"] and "不可行" in d["warning"]
     print("26) infeasible version forecast carries warning")
+
+    # 27) suspended days schedule no batches and consume no stock -------- #
+    d = client.post(fc_url, json=fc_body(
+        suspended_dates=["2026-05-02"],
+        stock=[{"concentrate": "A液", "stock_ml": 100000},
+               {"concentrate": "B液", "stock_ml": 100000}])).json()
+    assert d["suspended_dates"] == ["2026-05-02"]
+    assert d["planned_water_ml"] == 2000  # day 1 + day 3 only
+    assert d["batch_count_before_merge"] == 6
+    assert d["batch_count_after_merge"] == 4
+    liq = {x["concentrate"]: x for x in d["liquids"]}
+    assert abs(liq["A液"]["total_required_ml"] - 300) < 1e-6
+    assert abs(liq["B液"]["total_required_ml"] - 25) < 1e-6
+    fdays = {x["date"]: x for x in d["day_results"]}
+    sday = fdays["2026-05-02"]
+    assert sday["suspended"] is True
+    assert sday["batches"] == 0 and sday["water_ml"] == 0
+    assert sday["sufficient"] is True
+    # end-of-day stock unchanged across the suspended day
+    rem1 = {x["concentrate"]: x["remaining_ml"]
+            for x in fdays["2026-05-01"]["liquids"]}
+    rem2 = {x["concentrate"]: x["remaining_ml"]
+            for x in sday["liquids"]}
+    assert rem1 == rem2
+    # cross-midnight batch begun day 1 still deducted once on day 1
+    attrs = sorted(b["attributed_date"] for b in d["batches"])
+    assert attrs == ["2026-05-01", "2026-05-01",
+                     "2026-05-03", "2026-05-03"]
+    # shortage that would land on day 2 is skipped to the next active day
+    late = client.post(fc_url, json=fc_body(
+        suspended_dates=["2026-05-02"],
+        stock=[{"concentrate": "A液", "stock_ml": 100000},
+               {"concentrate": "B液", "stock_ml": 20}])).json()
+    assert late["first_shortfall_date"] == "2026-05-03"
+    fc_422({"suspended_dates": ["2026-05-02", "2026-05-02"]},
+           "duplicate suspended date")
+    fc_422({"suspended_dates": ["2026-05-04"]}, "suspended after range")
+    print("27) forecast suspended days: no deduction, cross-midnight kept")
 
 print("\nALL SMOKE TESTS PASSED")

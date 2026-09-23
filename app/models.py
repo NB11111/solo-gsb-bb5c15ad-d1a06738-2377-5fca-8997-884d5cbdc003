@@ -215,6 +215,15 @@ class IrrigationScheduleBase(BaseModel):
     sessions: list[IrrigationSessionInput] = Field(
         ..., min_length=1, description="每日重复的灌溉开始时段（至少 1 个）"
     )
+    suspended_dates: list[date] = Field(
+        default_factory=list,
+        description=(
+            "本地停灌日期列表（按 timezone 解释的本地日历日）：列表中的日期"
+            "不生成当日排定的灌溉批次，响应仍保留这些日期并标明停灌；"
+            "不影响前一日本地日期开始、跨入该日的跨午夜批次；"
+            "日期须落在 start_date~end_date 内且不可重复"
+        ),
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -247,6 +256,16 @@ class IrrigationScheduleBase(BaseModel):
             seen.add(s.start_time)
         return v
 
+    @field_validator("suspended_dates")
+    @classmethod
+    def _unique_suspended_dates(cls, v: list[date]) -> list[date]:
+        seen: set[date] = set()
+        for d in v:
+            if d in seen:
+                raise ValueError(f"停灌日期 {d.isoformat()} 重复")
+            seen.add(d)
+        return v
+
     @model_validator(mode="after")
     def _validate_range(self) -> "IrrigationScheduleBase":
         if self.end_date < self.start_date:
@@ -259,6 +278,17 @@ class IrrigationScheduleBase(BaseModel):
         if span > MAX_PLAN_DAYS:
             raise ValueError(
                 f"日期范围最多 {MAX_PLAN_DAYS} 天，当前 {span} 天"
+            )
+        out_of_range = [
+            d for d in self.suspended_dates
+            if d < self.start_date or d > self.end_date
+        ]
+        if out_of_range:
+            bad = ", ".join(d.isoformat() for d in sorted(out_of_range))
+            raise ValueError(
+                "停灌日期必须落在 "
+                f"{self.start_date.isoformat()}~{self.end_date.isoformat()} "
+                f"范围内：{bad}"
             )
         return self
 
@@ -307,6 +337,9 @@ class CapacityViolation(BaseModel):
 
 class IrrigationDayResult(BaseModel):
     date: str
+    suspended: bool = Field(
+        False, description="当日是否为停灌日：停灌日不生成当日排定批次，水量为 0"
+    )
     batch_count_before_merge: int
     batch_count_after_merge: int
     planned_water_ml: float
@@ -321,6 +354,10 @@ class IrrigationPlanResult(BaseModel):
     start_date: str
     end_date: str
     days: int
+    suspended_dates: list[str] = Field(
+        default_factory=list,
+        description="请求中的停灌日期（原样保留，已按日期升序排列）；这些日期不排定批次",
+    )
     batch_count_before_merge: int
     batch_count_after_merge: int
     merge_gap_seconds: int
@@ -405,6 +442,9 @@ class ForecastDayLiquid(BaseModel):
 
 class ForecastDay(BaseModel):
     date: str
+    suspended: bool = Field(
+        False, description="当日是否为停灌日：停灌日不排定批次、不扣减库存"
+    )
     batches: int = Field(..., description="归属本日的实际（合并后）批次数")
     water_ml: float
     sufficient: bool
@@ -437,6 +477,10 @@ class ConsumptionForecastResult(BaseModel):
     start_date: str
     end_date: str
     days: int
+    suspended_dates: list[str] = Field(
+        default_factory=list,
+        description="请求中的停灌日期（原样保留，已按日期升序排列）；这些日期不排定批次、不扣减库存",
+    )
     batch_count_before_merge: int
     batch_count_after_merge: int
     planned_water_ml: float

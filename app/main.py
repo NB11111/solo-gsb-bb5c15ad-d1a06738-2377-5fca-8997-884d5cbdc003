@@ -72,6 +72,8 @@ def irrigation_plan(req: IrrigationPlanRequest) -> IrrigationPlanResult:
     - 每日容量按**合并前**当日计划总水量校验；超出容量的日期在
       ``capacity_violations`` 中给出明确缺口（``shortfall_ml``），
       批次照常返回、绝不截断水量。
+    - ``suspended_dates`` 中的本地日期停灌：不生成当日排定的批次，
+      响应仍保留这些日期并标明停灌；不取消前一日开始的跨午夜批次。
     - 非法时区/日期/时间、空时段、重复开始时间、负数等均返回 422。
     """
     tz = ZoneInfo(req.timezone)
@@ -86,6 +88,7 @@ def irrigation_plan(req: IrrigationPlanRequest) -> IrrigationPlanResult:
         end_date=req.end_date,
         sessions=sessions,
         daily_capacity_ml=req.daily_capacity_ml,
+        suspended_dates=set(req.suspended_dates),
     )
     return IrrigationPlanResult(**plan)
 
@@ -189,6 +192,8 @@ def consumption_forecast(
     - 配方中每升灌溉水需要的各浓缩液体积（``allocations /
       total_volume_ml``）乘以每个**合并后实际批次**的水量得到本批需求；
       跨午夜/合并批次整体只扣一次（归属批次本地开始日）。
+    - ``suspended_dates`` 中的本地日期停灌：当日不排定批次、不扣减库存，
+      但前一日本地日期开始、跨入该日的批次仍照常扣减一次。
     - 任一浓缩液库存不足时：批次水量与需求保持完整，实际扣减到 0 为止，
       缺口记入该批次与当日，**绝不出现负库存**，后续批次预测照常进行。
     - 输出每日消耗/剩余、各液全程汇总以及首个出现缺口的本地日期。
@@ -218,6 +223,7 @@ def consumption_forecast(
                 for s in req.sessions
             ],
             stock=stock,
+            suspended_dates=set(req.suspended_dates),
         )
     except ForecastError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
